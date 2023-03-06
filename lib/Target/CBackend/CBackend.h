@@ -336,7 +336,7 @@ private:
     errorWithMessage("unsupported LLVM instruction");
   }
 
-  LLVM_ATTRIBUTE_NORETURN void errorWithMessage(const char *message);
+  [[noreturn]] void errorWithMessage(const char *message);
 
   bool isGotoCodeNecessary(BasicBlock *From, BasicBlock *To);
   bool canDeclareLocalLate(Instruction &I);

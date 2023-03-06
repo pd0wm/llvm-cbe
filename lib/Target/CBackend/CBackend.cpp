@@ -18,15 +18,16 @@
 #include "llvm/IR/DebugInfoMetadata.h"
 #include "llvm/IR/InstIterator.h"
 #include "llvm/IR/PatternMatch.h"
+#include "llvm/MC/TargetRegistry.h"
 #include "llvm/Support/Debug.h"
 #include "llvm/Support/ErrorHandling.h"
 #include "llvm/Support/Host.h"
 #include "llvm/Support/MathExtras.h"
-#include "llvm/Support/TargetRegistry.h"
 
 #include "TopologicalSorter.h"
 
 #include <algorithm>
+#include <cmath>
 #include <cstdio>
 
 #include <iostream>
@@ -83,7 +84,7 @@ bool IsPowerOfTwo(unsigned long x)
 
 unsigned int NumberOfElements(VectorType *TheType) {
 #if LLVM_VERSION_MAJOR >= 12
-  return TheType->getElementCount().getValue();
+  return TheType->getElementCount().getKnownMinValue();
 #else
   return TheType->getNumElements();
 #endif
@@ -120,9 +121,9 @@ static bool isEmptyType(Type *Ty) {
            std::all_of(STy->element_begin(), STy->element_end(), isEmptyType);
 
   if (VectorType *VTy = dyn_cast<VectorType>(Ty))
-    return NumberOfElements(VTy) == 0 || isEmptyType(VTy->getElementType());
+    return NumberOfElements(VTy) == 0 || isEmptyType(VTy->getPointerElementType());
   if (ArrayType *ATy = dyn_cast<ArrayType>(Ty))
-    return ATy->getNumElements() == 0 || isEmptyType(ATy->getElementType());
+    return ATy->getNumElements() == 0 || isEmptyType(ATy->getPointerElementType());
 
   return Ty->isVoidTy();
 }
@@ -298,7 +299,7 @@ raw_ostream &CWriter::printTypeString(raw_ostream &Out, Type *Ty,
     VectorType *VTy = cast<VectorType>(Ty);
 #endif
     cwriter_assert(VTy->getNumElements() != 0);
-    printTypeString(Out, VTy->getElementType(), isSigned);
+    printTypeString(Out, VTy->getPointerElementType(), isSigned);
     return Out << "x" << NumberOfElements(VTy);
   }
 
@@ -306,7 +307,7 @@ raw_ostream &CWriter::printTypeString(raw_ostream &Out, Type *Ty,
     TypedefDeclTypes.insert(Ty);
     ArrayType *ATy = cast<ArrayType>(Ty);
     cwriter_assert(ATy->getNumElements() != 0);
-    printTypeString(Out, ATy->getElementType(), isSigned);
+    printTypeString(Out, ATy->getPointerElementType(), isSigned);
     return Out << "a" << ATy->getNumElements();
   }
 
@@ -338,7 +339,7 @@ std::string CWriter::getArrayName(ArrayType *AT) {
   // Arrays are wrapped in structs to allow them to have normal
   // value semantics (avoiding the array "decay").
   cwriter_assert(!isEmptyType(AT));
-  printTypeName(ArrayInnards, AT->getElementType(), false);
+  printTypeName(ArrayInnards, AT->getPointerElementType(), false);
   return "struct l_array_" + utostr(AT->getNumElements()) + '_' +
          CBEMangle(ArrayInnards.str());
 }
@@ -352,7 +353,7 @@ std::string CWriter::getVectorName(VectorType *VT, bool Aligned) {
     headerUseMsAlign();
     Out << "__MSALIGN__(" << TD->getABITypeAlignment(VT) << ") ";
   }
-  printTypeName(VectorInnards, VT->getElementType(), false);
+  printTypeName(VectorInnards, VT->getPointerElementType(), false);
   return "struct l_vector_" + utostr(NumberOfElements(VT)) + '_' +
          CBEMangle(VectorInnards.str());
 }
@@ -565,9 +566,13 @@ CWriter::printTypeName(raw_ostream &Out, Type *Ty, bool isSigned,
   }
 
   case Type::PointerTyID: {
-    Type *ElTy = Ty->getPointerElementType();
-    ElTy = skipEmptyArrayTypes(ElTy);
-    return printTypeName(Out, ElTy, false) << '*';
+    if (Ty->getNumContainedTypes()) {
+      Type *ElTy = Ty->getPointerElementType();
+      ElTy = skipEmptyArrayTypes(ElTy);
+      return printTypeName(Out, ElTy, false) << '*';
+    } else {
+      return Out;
+    }
   }
 
   case Type::ArrayTyID: {
@@ -634,7 +639,7 @@ raw_ostream &CWriter::printStructDeclaration(raw_ostream &Out,
 raw_ostream &CWriter::printFunctionAttributes(raw_ostream &Out,
                                               AttributeList Attrs) {
   SmallVector<std::string, 5> AttrsToPrint;
-  for (const auto &FnAttr : Attrs.getFnAttributes()) {
+  for (const auto &FnAttr : Attrs.getFnAttrs()) {
     if (FnAttr.isEnumAttribute() || FnAttr.isIntAttribute()) {
       switch (FnAttr.getKindAsEnum()) {
       case Attribute::AttrKind::AlwaysInline:
@@ -671,10 +676,10 @@ raw_ostream &CWriter::printFunctionAttributes(raw_ostream &Out,
         break;
       case Attribute::AttrKind::AllocSize: {
         const auto AllocSize = FnAttr.getAllocSizeArgs();
-        if (AllocSize.second.hasValue()) {
+        if (AllocSize.second.has_value()) {
           AttrsToPrint.push_back(
               "alloc_size(" + std::to_string(AllocSize.first) + "," +
-              std::to_string(AllocSize.second.getValue()) + ")");
+              std::to_string(AllocSize.second.value()) + ")");
         } else {
           AttrsToPrint.push_back("alloc_size(" +
                                  std::to_string(AllocSize.first) + ")");
@@ -771,7 +776,7 @@ CWriter::printFunctionProto(raw_ostream &Out, FunctionType *FTy,
 
   AttributeList &PAL = Attrs.first;
 
-  if (PAL.hasAttribute(AttributeList::FunctionIndex, Attribute::NoReturn)) {
+  if (PAL.hasFnAttr(Attribute::NoReturn)) {
     headerUseNoReturn();
     Out << "__noreturn ";
   }
@@ -781,20 +786,20 @@ CWriter::printFunctionProto(raw_ostream &Out, FunctionType *FTy,
     Out << MainArgs.begin()[0].first;
   } else {
     // Should this function actually return a struct by-value?
-    isStructReturn = PAL.hasAttribute(1, Attribute::StructRet) ||
-                     PAL.hasAttribute(2, Attribute::StructRet);
+    isStructReturn = PAL.hasAttributeAtIndex(1, Attribute::StructRet) ||
+                     PAL.hasAttributeAtIndex(2, Attribute::StructRet);
     // Get the return type for the function.
     Type *RetTy;
     if (!isStructReturn)
       RetTy = FTy->getReturnType();
     else {
       // If this is a struct-return function, print the struct-return type.
-      RetTy = cast<PointerType>(FTy->getParamType(0))->getElementType();
+      RetTy = cast<PointerType>(FTy->getParamType(0))->getPointerElementType();
     }
     printTypeName(
         Out, RetTy,
         /*isSigned=*/
-        PAL.hasAttribute(AttributeList::ReturnIndex, Attribute::SExt));
+        PAL.hasAttributeAtIndex(AttributeList::ReturnIndex, Attribute::SExt));
   }
 
   switch (Attrs.second) {
@@ -842,10 +847,10 @@ CWriter::printFunctionProto(raw_ostream &Out, FunctionType *FTy,
     if (ArgTy->isMetadataTy())
       continue;
 
-    if (PAL.hasAttribute(Idx, Attribute::ByVal)) {
+    if (PAL.hasAttributeAtIndex(Idx, Attribute::ByVal)) {
       cwriter_assert(!shouldFixMain);
       cwriter_assert(ArgTy->isPointerTy());
-      ArgTy = cast<PointerType>(ArgTy)->getElementType();
+      ArgTy = cast<PointerType>(ArgTy)->getPointerElementType();
     }
     if (PrintedArg)
       Out << ", ";
@@ -854,7 +859,7 @@ CWriter::printFunctionProto(raw_ostream &Out, FunctionType *FTy,
     else
       printTypeNameUnaligned(
           Out, ArgTy,
-          /*isSigned=*/PAL.hasAttribute(Idx, Attribute::SExt));
+          /*isSigned=*/PAL.hasAttributeAtIndex(Idx, Attribute::SExt));
     PrintedArg = true;
     if (ArgList) {
       Out << ' ';
@@ -887,7 +892,7 @@ raw_ostream &CWriter::printArrayDeclaration(raw_ostream &Out, ArrayType *ATy) {
   // Arrays are wrapped in structs to allow them to have normal
   // value semantics (avoiding the array "decay").
   Out << getArrayName(ATy) << " {\n  ";
-  printTypeName(Out, ATy->getElementType());
+  printTypeName(Out, ATy->getPointerElementType());
   Out << " array[" << utostr(ATy->getNumElements()) << "];\n};\n";
   return Out;
 }
@@ -897,7 +902,7 @@ raw_ostream &CWriter::printVectorDeclaration(raw_ostream &Out,
   cwriter_assert(!isEmptyType(VTy));
   // Vectors are printed like arrays
   Out << getVectorName(VTy, false) << " {\n  ";
-  printTypeName(Out, VTy->getElementType());
+  printTypeName(Out, VTy->getPointerElementType());
   Out << " vector[" << utostr(NumberOfElements(VTy))
       << "];\n} __attribute__((aligned(" << TD->getABITypeAlignment(VTy)
       << ")));\n";
@@ -1314,7 +1319,7 @@ void CWriter::printConstant(Constant *CPV, enum OperandContext Context) {
       Out << "/*undef*/llvm_ctor_";
       printTypeString(Out, VT, false);
       Out << "(";
-      Constant *Zero = Constant::getNullValue(VT->getElementType());
+      Constant *Zero = Constant::getNullValue(VT->getPointerElementType());
 
       unsigned NumElts = NumberOfElements(VT);
       for (unsigned i = 0; i != NumElts; ++i) {
@@ -1472,7 +1477,7 @@ void CWriter::printConstant(Constant *CPV, enum OperandContext Context) {
       printConstantDataSequential(CDS, Context);
     } else {
       cwriter_assert(isa<ConstantAggregateZero>(CPV) || isa<UndefValue>(CPV));
-      Constant *CZ = Constant::getNullValue(AT->getElementType());
+      Constant *CZ = Constant::getNullValue(AT->getPointerElementType());
       printConstant(CZ, Context);
       for (unsigned i = 1, e = AT->getNumElements(); i != e; ++i) {
         Out << ", ";
@@ -1513,7 +1518,7 @@ void CWriter::printConstant(Constant *CPV, enum OperandContext Context) {
       printConstantDataSequential(CDS, Context);
     } else {
       cwriter_assert(isa<ConstantAggregateZero>(CPV) || isa<UndefValue>(CPV));
-      Constant *CZ = Constant::getNullValue(VT->getElementType());
+      Constant *CZ = Constant::getNullValue(VT->getPointerElementType());
       printConstant(CZ, Context);
 
       for (unsigned i = 1, e = NumberOfElements(VT); i != e; ++i) {
@@ -1767,7 +1772,7 @@ void CWriter::writeOperand(Value *Operand, enum OperandContext Context) {
     // We can't directly declare a zero-sized variable in C, so
     // printTypeNameForAddressableValue uses a single-byte type instead.
     // We fix up the pointer type here.
-    if (!isEmptyType(Operand->getType()->getPointerElementType()))
+    if (!Operand->getType()->getNumContainedTypes())
       Out << "(&";
     else
       Out << "((void*)&";
@@ -2467,9 +2472,9 @@ void CWriter::generateHeader(Module &M) {
   for (Module::global_iterator I = M.global_begin(), E = M.global_end(); I != E;
        ++I) {
     // Ignore special globals, such as debug info.
-    if (getGlobalVariableClass(&*I))
+    if (getGlobalVariableClass(&*I) || !I->getType()->getNumContainedTypes())
       continue;
-    printTypeName(NullOut, I->getType()->getElementType(), false);
+    printTypeName(NullOut, I->getType()->getPointerElementType(), false);
   }
   printModuleTypes(Out);
 
@@ -2499,7 +2504,7 @@ void CWriter::generateHeader(Module &M) {
       if (I->isThreadLocal())
         Out << "__thread ";
 
-      Type *ElTy = I->getType()->getElementType();
+      Type *ElTy = I->getType()->getPointerElementType();
       unsigned Alignment = I->getAlignment();
       bool IsOveraligned =
           Alignment && Alignment > TD->getABITypeAlignment(ElTy);
@@ -2637,7 +2642,8 @@ void CWriter::generateHeader(Module &M) {
       if (I->isThreadLocal())
         Out << "__thread ";
 
-      Type *ElTy = I->getType()->getElementType();
+      Type *ElTy = I->getType()->getPointerElementType();
+      /* TODO: where did getBaseObject go?
       unsigned Alignment = I->getBaseObject()->getAlignment();
       bool IsOveraligned =
           Alignment && Alignment > TD->getABITypeAlignment(ElTy);
@@ -2651,6 +2657,7 @@ void CWriter::generateHeader(Module &M) {
       if (IsOveraligned)
         Out << " __attribute__((aligned(" << Alignment << ")))";
 
+      */
       if (I->hasExternalWeakLinkage()) {
         headerUseExternalWeak();
         Out << " __EXTERNAL_WEAK__";
@@ -2950,7 +2957,7 @@ void CWriter::generateHeader(Module &M) {
     unsigned opcode = (*it).first;
     Type *OpTy = (*it).second;
     Type *ElemTy =
-        isa<VectorType>(OpTy) ? cast<VectorType>(OpTy)->getElementType() : OpTy;
+        isa<VectorType>(OpTy) ? cast<VectorType>(OpTy)->getPointerElementType() : OpTy;
     bool shouldCast;
     bool isSigned;
     opcodeNeedsCast(opcode, shouldCast, isSigned);
@@ -3385,7 +3392,7 @@ void CWriter::declareOneGlobalVariable(GlobalVariable *I) {
   if (I->isThreadLocal())
     Out << "__thread ";
 
-  Type *ElTy = I->getType()->getElementType();
+  Type *ElTy = I->getType()->getPointerElementType();
   unsigned Alignment = I->getAlignment();
   bool IsOveraligned = Alignment && Alignment > TD->getABITypeAlignment(ElTy);
   if (IsOveraligned) {
@@ -3562,7 +3569,7 @@ void CWriter::printModuleTypes(raw_ostream &Out) {
     for (const auto P : F.first->params()) {
       // Handle arbitrarily deep pointer indirection
       Type *PP = P;
-      while (PP->isPointerTy())
+      while (PP->isPointerTy() && PP->getNumContainedTypes())
         PP = PP->getPointerElementType();
       if (auto *PPF = dyn_cast<FunctionType>(PP))
         FDeps.push_back(PPF);
@@ -3589,11 +3596,11 @@ void CWriter::printModuleTypes(raw_ostream &Out) {
       Sorter.addEdge(I, TopologicalSortMap[Dependencies[J]]);
     }
   }
-  Optional<std::vector<int>> TopologicalSortResult = Sorter.sort();
-  if (!TopologicalSortResult.hasValue()) {
+  std::optional<std::vector<int>> TopologicalSortResult = Sorter.sort();
+  if (!TopologicalSortResult.has_value()) {
     errorWithMessage("Cyclic dependencies in function definitions");
   }
-  for (const auto I : TopologicalSortResult.getValue()) {
+  for (const auto I : TopologicalSortResult.value()) {
     Out << FunctionTypeDefinitions[I].NameToPrint << "\n";
   }
 
@@ -3746,7 +3753,7 @@ void CWriter::printFunction(Function &F) {
   // If this is a struct return function, handle the result with magic.
   if (isStructReturn) {
     Type *StructTy =
-        cast<PointerType>(F.arg_begin()->getType())->getElementType();
+        cast<PointerType>(F.arg_begin()->getType())->getPointerElementType();
     Out << "  ";
     printTypeName(Out, StructTy, false)
         << " StructReturn;  /* Struct return temporary */\n";
@@ -3761,7 +3768,7 @@ void CWriter::printFunction(Function &F) {
   // print local variable information for the function
   for (inst_iterator I = inst_begin(&F), E = inst_end(&F); I != E; ++I) {
     if (AllocaInst *AI = isDirectAlloca(&*I)) {
-      unsigned Alignment = AI->getAlignment();
+      unsigned Alignment = AI->getAlign().value();
       bool IsOveraligned = Alignment && Alignment > TD->getABITypeAlignment(
                                                         AI->getAllocatedType());
       Out << "  ";
@@ -4831,9 +4838,7 @@ void CWriter::visitCallInst(CallInst &I) {
   }
 
   Value *Callee = I.getCalledOperand();
-
-  PointerType *PTy = cast<PointerType>(Callee->getType());
-  FunctionType *FTy = cast<FunctionType>(PTy->getElementType());
+  FunctionType *FTy = I.getFunctionType();
 
   // If this is a call to a struct-return function, assign to the first
   // parameter instead of passing it to the call.
@@ -4920,11 +4925,11 @@ void CWriter::visitCallInst(CallInst &I) {
       Out << '(';
       printTypeNameUnaligned(
           Out, FTy->getParamType(ArgNo),
-          /*isSigned=*/PAL.hasAttribute(ArgNo + 1, Attribute::SExt));
+          /*isSigned=*/PAL.hasAttributeAtIndex(ArgNo + 1, Attribute::SExt));
       Out << ')';
     }
     // Check if the argument is expected to be passed by value.
-    if (I.getAttributes().hasAttribute(ArgNo + 1, Attribute::ByVal))
+    if (I.getAttributes().hasAttributeAtIndex(ArgNo + 1, Attribute::ByVal))
       writeOperandDeref(*AI);
     else
       writeOperand(*AI, ContextCasted);
@@ -5331,7 +5336,7 @@ void CWriter::visitAllocaInst(AllocaInst &I) {
   Out << '(';
   printTypeName(Out, I.getType());
   Out << ") alloca(sizeof(";
-  printTypeName(Out, I.getType()->getElementType());
+  printTypeName(Out, I.getType()->getPointerElementType());
   if (I.isArrayAllocation()) {
     Out << ") * (";
     writeOperand(I.getArraySize(), ContextCasted);
@@ -5367,7 +5372,7 @@ void CWriter::printGEPExpression(Value *Ptr, gep_type_iterator I,
   if (LastIndexIsVector) {
     Out << "((";
     printTypeName(Out,
-                  PointerType::getUnqual(LastIndexIsVector->getElementType()));
+                  PointerType::getUnqual(LastIndexIsVector->getPointerElementType()));
     Out << ")(";
   }
 
@@ -5492,14 +5497,14 @@ void CWriter::visitLoadInst(LoadInst &I) {
   CurInstr = &I;
 
   writeMemoryAccess(I.getOperand(0), I.getType(), I.isVolatile(),
-                    I.getAlignment());
+                    I.getAlign().value());
 }
 
 void CWriter::visitStoreInst(StoreInst &I) {
   CurInstr = &I;
 
   writeMemoryAccess(I.getPointerOperand(), I.getOperand(0)->getType(),
-                    I.isVolatile(), I.getAlignment());
+                    I.isVolatile(), I.getAlign().value());
   Out << " = ";
   Value *Operand = I.getOperand(0);
   unsigned BitMask = 0;
@@ -5569,7 +5574,7 @@ void CWriter::visitInsertElementInst(InsertElementInst &I) {
 
   // Start by copying the entire aggregate value into the result variable.
   writeOperand(I.getOperand(0));
-  Type *EltTy = I.getType()->getElementType();
+  Type *EltTy = I.getType()->getPointerElementType();
   cwriter_assert(I.getOperand(1)->getType() == EltTy);
   if (isEmptyType(EltTy))
     return;
@@ -5605,10 +5610,10 @@ void CWriter::visitShuffleVectorInst(ShuffleVectorInst &SVI) {
   CurInstr = &SVI;
 
   VectorType *VT = SVI.getType();
-  Type *EltTy = VT->getElementType();
+  Type *EltTy = VT->getPointerElementType();
   VectorType *InputVT = cast<VectorType>(SVI.getOperand(0)->getType());
   cwriter_assert(!isEmptyType(VT));
-  cwriter_assert(InputVT->getElementType() == VT->getElementType());
+  cwriter_assert(InputVT->getPointerElementType() == VT->getPointerElementType());
 
   CtorDeclTypes.insert(VT);
   Out << "llvm_ctor_";
@@ -5700,7 +5705,7 @@ void CWriter::visitExtractValueInst(ExtractValueInst &EVI) {
   Out << ")";
 }
 
-LLVM_ATTRIBUTE_NORETURN void CWriter::errorWithMessage(const char *message) {
+[[noreturn]] void CWriter::errorWithMessage(const char *message) {
 #ifndef NDEBUG
   errs() << message;
   errs() << " in: ";

@@ -14,7 +14,7 @@
 #ifndef TOPOLOGICALSORTER_H
 #define TOPOLOGICALSORTER_H
 
-#include <llvm/ADT/Optional.h>
+#include <optional>
 #include <vector>
 
 namespace llvm_cbe {
@@ -35,7 +35,7 @@ public:
   explicit TopologicalSorter(int Size);
 
   void addEdge(int Start, int End);
-  llvm::Optional<std::vector<int>> sort(); // Returns None if there are cycles
+  std::optional<std::vector<int>> sort(); // Returns None if there are cycles
 };
 
 } // namespace llvm_cbe

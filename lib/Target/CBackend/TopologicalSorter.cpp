@@ -26,10 +26,10 @@ TopologicalSorter::TopologicalSorter(int Size) {
   Result.reserve(Size);
 }
 
-llvm::Optional<std::vector<int>> TopologicalSorter::sort() {
+std::optional<std::vector<int>> TopologicalSorter::sort() {
   for (int I = 0; I < Size; ++I) {
     if (visit(I)) {
-      return llvm::None;
+      return std::nullopt;
     }
   }
   return Result;
